@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -15,12 +15,15 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
-use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::{
+    merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator, StorageIterator,
+};
+use crate::key::Key;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -280,7 +283,11 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let state = self.state.read();
+        let state = {
+            let state = self.state.read();
+            Arc::clone(&state)
+        };
+
         if let Some(value) = state.memtable.get(key) {
             return Ok(Some(value).filter(|value| !value.is_empty()));
         }
@@ -288,6 +295,36 @@ impl LsmStorageInner {
         for imm_memtable in state.imm_memtables.iter() {
             if let Some(value) = imm_memtable.get(key) {
                 return Ok(Some(value).filter(|value| !value.is_empty()));
+            }
+        }
+
+        for l0_sstable_id in state.l0_sstables.iter() {
+            let Some(sstable) = state.sstables.get(l0_sstable_id) else {
+                bail!("sstable with id={l0_sstable_id} is missing");
+            };
+
+            if !sstable.may_contain(key) {
+                continue;
+            }
+
+            let is_key_within = key_within(
+                key,
+                Bound::Included(sstable.first_key().raw_ref()),
+                Bound::Included(sstable.last_key().raw_ref()),
+            );
+
+            if !is_key_within {
+                continue;
+            }
+
+            let iter =
+                SsTableIterator::create_and_seek_to_key(Arc::clone(sstable), Key::from_slice(key))?;
+
+            if iter.is_valid() && iter.key().raw_ref() == key {
+                let value = Some(iter.value())
+                    .filter(|value| !value.is_empty())
+                    .map(Bytes::copy_from_slice);
+                return Ok(value);
             }
         }
 
@@ -380,12 +417,100 @@ impl LsmStorageInner {
             memtable_iters.push(Box::new(imm_memtable.scan(lower, upper)));
         }
 
-        let merge_iter = MergeIterator::create(memtable_iters);
-        Ok(FusedIterator::new(LsmIterator::new(merge_iter)?))
+        let mut l0_sstable_iters = Vec::with_capacity(state.l0_sstables.len());
+        for l0_sstable_id in state.l0_sstables.iter() {
+            let Some(l0_sstable) = state.sstables.get(l0_sstable_id) else {
+                bail!("sstable with id={l0_sstable_id} does not exist");
+            };
+
+            let does_range_overlap = range_overlap(
+                l0_sstable.first_key().raw_ref(),
+                l0_sstable.last_key().raw_ref(),
+                lower,
+                upper,
+            );
+
+            if !does_range_overlap {
+                continue;
+            }
+
+            let iter = match lower {
+                Bound::Included(key) => SsTableIterator::create_and_seek_to_key(
+                    Arc::clone(l0_sstable),
+                    Key::from_slice(key),
+                )?,
+                Bound::Excluded(key) => {
+                    let mut iter = SsTableIterator::create_and_seek_to_key(
+                        Arc::clone(l0_sstable),
+                        Key::from_slice(key),
+                    )?;
+                    if iter.is_valid() && iter.key().raw_ref() == key {
+                        iter.next()?;
+                    }
+                    iter
+                }
+                Bound::Unbounded => {
+                    SsTableIterator::create_and_seek_to_first(Arc::clone(l0_sstable))?
+                }
+            };
+
+            l0_sstable_iters.push(Box::new(iter));
+        }
+
+        Ok(FusedIterator::new(LsmIterator::new(
+            TwoMergeIterator::create(
+                MergeIterator::create(memtable_iters),
+                MergeIterator::create(l0_sstable_iters),
+            )?,
+            map_bound(upper, Bytes::copy_from_slice),
+        )?))
     }
 
     fn memtable_reached_capacity(&self) -> bool {
         let state = self.state.read();
         state.memtable.approximate_size() >= self.options.target_sst_size
     }
+}
+
+pub fn key_within(key: &[u8], lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+    let above_lower = match lower {
+        Bound::Included(lower) => key >= lower,
+        Bound::Excluded(lower) => key > lower,
+        Bound::Unbounded => true,
+    };
+
+    let below_upper = match upper {
+        Bound::Included(upper) => key <= upper,
+        Bound::Excluded(upper) => key < upper,
+        Bound::Unbounded => true,
+    };
+
+    above_lower && below_upper
+}
+
+pub fn key_less_or_equal(key: &[u8], lower: Bound<&[u8]>) -> bool {
+    match lower {
+        Bound::Included(lower) => key <= lower,
+        Bound::Excluded(lower) => key < lower,
+        Bound::Unbounded => false,
+    }
+}
+
+pub fn key_greater_or_equal(key: &[u8], upper: Bound<&[u8]>) -> bool {
+    match upper {
+        Bound::Included(upper) => key >= upper,
+        Bound::Excluded(upper) => key > upper,
+        Bound::Unbounded => false,
+    }
+}
+
+fn range_overlap(
+    lower: &[u8],
+    upper: &[u8],
+    lower_bound: Bound<&[u8]>,
+    upper_bound: Bound<&[u8]>,
+) -> bool {
+    key_within(lower, lower_bound, upper_bound)
+        || key_within(upper, lower_bound, upper_bound)
+        || (key_less_or_equal(lower, lower_bound) && key_greater_or_equal(upper, upper_bound))
 }

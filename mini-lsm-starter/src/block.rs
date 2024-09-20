@@ -15,6 +15,13 @@ pub struct Block {
 }
 
 impl Block {
+    pub(crate) fn empty() -> Self {
+        Self {
+            data: Vec::new(),
+            offsets: Vec::new(),
+        }
+    }
+
     /// Encode the internal data to the data layout illustrated in the tutorial
     /// Note: You may want to recheck if any of the expected field is missing from your output
     pub fn encode(&self) -> Bytes {

@@ -9,13 +9,13 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 pub use builder::SsTableBuilder;
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
-use crate::key::{KeyBytes, KeySlice};
+use crate::key::{Key, KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
 
 use self::bloom::Bloom;
@@ -39,12 +39,39 @@ impl BlockMeta {
         #[allow(clippy::ptr_arg)] // remove this allow after you finish
         buf: &mut Vec<u8>,
     ) {
-        unimplemented!()
+        for meta in block_meta {
+            let offset = (meta.offset as u16).to_be_bytes();
+            let first_key_len = (meta.first_key.len() as u16).to_be_bytes();
+            let last_key_len = (meta.last_key.len() as u16).to_be_bytes();
+
+            buf.extend_from_slice(&offset);
+            buf.extend_from_slice(&first_key_len);
+            buf.extend_from_slice(meta.first_key.raw_ref());
+            buf.extend_from_slice(&last_key_len);
+            buf.extend_from_slice(meta.last_key.raw_ref());
+        }
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
-        unimplemented!()
+    pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
+        let mut result = Vec::new();
+        while buf.remaining() > 0 {
+            let offset = buf.get_u16() as usize;
+            let first_key_len = buf.get_u16() as usize;
+            let first_key = Key::from_bytes(Bytes::copy_from_slice(&buf.chunk()[..first_key_len]));
+            buf.advance(first_key_len);
+
+            let last_key_len = buf.get_u16() as usize;
+            let last_key = Key::from_bytes(Bytes::copy_from_slice(&buf.chunk()[..last_key_len]));
+            buf.advance(last_key_len);
+
+            result.push(Self {
+                offset,
+                first_key,
+                last_key,
+            });
+        }
+        result
     }
 }
 
@@ -108,7 +135,45 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        unimplemented!()
+        let bloom_offset = file.read(file.size() - 4, 4)?;
+        let mut bloom_offset = Bytes::from(bloom_offset);
+        let bloom_offset = bloom_offset.get_u32() as u64;
+        let bloom_data = file.read(bloom_offset, file.size() - bloom_offset - 4)?;
+        let bloom = Bloom::decode(&bloom_data)?;
+
+        let block_meta_offset = file.read(bloom_offset - 4, 4)?;
+        let mut block_meta_offset = Bytes::from(block_meta_offset);
+        let block_meta_offset = block_meta_offset.get_u32() as u64;
+
+        let block_meta = file.read(
+            block_meta_offset,
+            file.size() - (4 + block_meta_offset) - (bloom_data.len() + 4) as u64,
+        )?;
+        let block_meta = BlockMeta::decode_block_meta(Bytes::from(block_meta));
+
+        let first_key = block_meta
+            .first()
+            .ok_or_else(|| anyhow!("table is empty"))?
+            .first_key
+            .clone();
+
+        let last_key = block_meta
+            .last()
+            .ok_or_else(|| anyhow!("table is empty"))?
+            .last_key
+            .clone();
+
+        Ok(Self {
+            file,
+            block_meta,
+            block_meta_offset: block_meta_offset as usize,
+            id,
+            block_cache,
+            first_key,
+            last_key,
+            bloom: Some(bloom),
+            max_ts: 0,
+        })
     }
 
     /// Create a mock SST with only first key + last key metadata
@@ -133,12 +198,33 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        let block_offset = self
+            .block_meta
+            .get(block_idx)
+            .ok_or_else(|| anyhow!("table is empty"))?
+            .offset as u64;
+
+        let block_len = self
+            .block_meta
+            .get(block_idx + 1)
+            .map(|block| block.offset as u64)
+            .unwrap_or(self.block_meta_offset as u64)
+            - block_offset;
+
+        let block = self.file.read(block_offset, block_len)?;
+        let block = Block::decode(&block);
+        Ok(Arc::new(block))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        if let Some(block_cache) = self.block_cache.as_ref() {
+            block_cache
+                .try_get_with((self.id, block_idx), || self.read_block(block_idx))
+                .map_err(|e| anyhow!("{e:?}"))
+        } else {
+            self.read_block(block_idx)
+        }
     }
 
     /// Find the block that may contain `key`.

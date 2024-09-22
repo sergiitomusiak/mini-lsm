@@ -15,6 +15,7 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::{
     merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator, StorageIterator,
 };
@@ -344,6 +345,36 @@ impl LsmStorageInner {
             }
         }
 
+        for sstable_id in state.levels[0].1.iter() {
+            let Some(sstable) = state.sstables.get(sstable_id) else {
+                bail!("sstable with id={sstable_id} is missing");
+            };
+
+            if !sstable.may_contain(key) {
+                continue;
+            }
+
+            let is_key_within = key_within(
+                key,
+                Bound::Included(sstable.first_key().raw_ref()),
+                Bound::Included(sstable.last_key().raw_ref()),
+            );
+
+            if !is_key_within {
+                continue;
+            }
+
+            let iter =
+                SsTableIterator::create_and_seek_to_key(Arc::clone(sstable), Key::from_slice(key))?;
+
+            if iter.is_valid() && iter.key().raw_ref() == key {
+                let value = Some(iter.value())
+                    .filter(|value| !value.is_empty())
+                    .map(Bytes::copy_from_slice);
+                return Ok(value);
+            }
+        }
+
         Ok(None)
     }
 
@@ -423,7 +454,7 @@ impl LsmStorageInner {
         let mut sstable_builder = SsTableBuilder::new(self.options.block_size);
         memtable_to_flush.flush(&mut sstable_builder)?;
 
-        let sstable_id = self.next_sst_id();
+        let sstable_id = memtable_to_flush.id();
         let sstable_path = self.path_of_sst(sstable_id);
         let sstable = sstable_builder.build(
             sstable_id,
@@ -504,10 +535,62 @@ impl LsmStorageInner {
             l0_sstable_iters.push(Box::new(iter));
         }
 
+        let mut sstables = Vec::new();
+        let mut matched_once = false;
+        for sstable_id in state.levels[0].1.iter() {
+            let Some(sstable) = state.sstables.get(sstable_id) else {
+                bail!("sstable with id={sstable_id} is missing");
+            };
+
+            let does_range_overlap = range_overlap(
+                sstable.first_key().raw_ref(),
+                sstable.last_key().raw_ref(),
+                lower,
+                upper,
+            );
+
+            if !does_range_overlap {
+                // TODO: Add optimization: if key range of current SSTable
+                // is already passed input key range, then break current loop to
+                // stop checking other SSTables.
+                if matched_once {
+                    // Current SSTable is already passed
+                    // current key range. Thus current and further
+                    // SSTables do not contain queried keys and can be ignored.
+                    break;
+                } else {
+                    // At this point none of the SSTables contained requested key range.
+                    // Thus continue checking other tables.
+                    continue;
+                }
+            }
+
+            matched_once = true;
+            sstables.push(Arc::clone(sstable));
+        }
+
+        let l1_iter = match lower {
+            Bound::Included(lower) => {
+                SstConcatIterator::create_and_seek_to_key(sstables, Key::from_slice(lower))?
+            }
+            Bound::Excluded(lower) => {
+                let mut iter =
+                    SstConcatIterator::create_and_seek_to_key(sstables, Key::from_slice(lower))?;
+                if iter.is_valid() && iter.key().raw_ref() == lower {
+                    iter.next()?;
+                }
+                iter
+            }
+            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(sstables)?,
+        };
+
         Ok(FusedIterator::new(LsmIterator::new(
             TwoMergeIterator::create(
-                MergeIterator::create(memtable_iters),
-                MergeIterator::create(l0_sstable_iters),
+                TwoMergeIterator::create(
+                    MergeIterator::create(memtable_iters),
+                    MergeIterator::create(l0_sstable_iters),
+                )?,
+                l1_iter,
             )?,
             map_bound(upper, Bytes::copy_from_slice),
         )?))

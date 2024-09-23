@@ -345,33 +345,37 @@ impl LsmStorageInner {
             }
         }
 
-        for sstable_id in state.levels[0].1.iter() {
-            let Some(sstable) = state.sstables.get(sstable_id) else {
-                bail!("sstable with id={sstable_id} is missing");
-            };
+        for level in 0..state.levels.len() {
+            for sstable_id in state.levels[level].1.iter() {
+                let Some(sstable) = state.sstables.get(sstable_id) else {
+                    bail!("sstable with id={sstable_id} is missing");
+                };
 
-            if !sstable.may_contain(key) {
-                continue;
-            }
+                if !sstable.may_contain(key) {
+                    continue;
+                }
 
-            let is_key_within = key_within(
-                key,
-                Bound::Included(sstable.first_key().raw_ref()),
-                Bound::Included(sstable.last_key().raw_ref()),
-            );
+                let is_key_within = key_within(
+                    key,
+                    Bound::Included(sstable.first_key().raw_ref()),
+                    Bound::Included(sstable.last_key().raw_ref()),
+                );
 
-            if !is_key_within {
-                continue;
-            }
+                if !is_key_within {
+                    continue;
+                }
 
-            let iter =
-                SsTableIterator::create_and_seek_to_key(Arc::clone(sstable), Key::from_slice(key))?;
+                let iter = SsTableIterator::create_and_seek_to_key(
+                    Arc::clone(sstable),
+                    Key::from_slice(key),
+                )?;
 
-            if iter.is_valid() && iter.key().raw_ref() == key {
-                let value = Some(iter.value())
-                    .filter(|value| !value.is_empty())
-                    .map(Bytes::copy_from_slice);
-                return Ok(value);
+                if iter.is_valid() && iter.key().raw_ref() == key {
+                    let value = Some(iter.value())
+                        .filter(|value| !value.is_empty())
+                        .map(Bytes::copy_from_slice);
+                    return Ok(value);
+                }
             }
         }
 
@@ -535,54 +539,61 @@ impl LsmStorageInner {
             l0_sstable_iters.push(Box::new(iter));
         }
 
-        let mut sstables = Vec::new();
-        let mut matched_once = false;
-        for sstable_id in state.levels[0].1.iter() {
-            let Some(sstable) = state.sstables.get(sstable_id) else {
-                bail!("sstable with id={sstable_id} is missing");
+        let mut level_iters = Vec::new();
+        for level in 0..state.levels.len() {
+            let mut sstables = Vec::new();
+            let mut matched_once = false;
+            for sstable_id in state.levels[level].1.iter() {
+                let Some(sstable) = state.sstables.get(sstable_id) else {
+                    bail!("sstable with id={sstable_id} is missing");
+                };
+
+                let does_range_overlap = range_overlap(
+                    sstable.first_key().raw_ref(),
+                    sstable.last_key().raw_ref(),
+                    lower,
+                    upper,
+                );
+
+                if !does_range_overlap {
+                    // TODO: Add optimization: if key range of current SSTable
+                    // is already passed input key range, then break current loop to
+                    // stop checking other SSTables.
+                    if matched_once {
+                        // Current SSTable is already passed
+                        // current key range. Thus current and further
+                        // SSTables do not contain queried keys and can be ignored.
+                        break;
+                    } else {
+                        // At this point none of the SSTables contained requested key range.
+                        // Thus continue checking other tables.
+                        continue;
+                    }
+                }
+
+                matched_once = true;
+                sstables.push(Arc::clone(sstable));
+            }
+
+            let level_iter = match lower {
+                Bound::Included(lower) => {
+                    SstConcatIterator::create_and_seek_to_key(sstables, Key::from_slice(lower))?
+                }
+                Bound::Excluded(lower) => {
+                    let mut iter = SstConcatIterator::create_and_seek_to_key(
+                        sstables,
+                        Key::from_slice(lower),
+                    )?;
+                    if iter.is_valid() && iter.key().raw_ref() == lower {
+                        iter.next()?;
+                    }
+                    iter
+                }
+                Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(sstables)?,
             };
 
-            let does_range_overlap = range_overlap(
-                sstable.first_key().raw_ref(),
-                sstable.last_key().raw_ref(),
-                lower,
-                upper,
-            );
-
-            if !does_range_overlap {
-                // TODO: Add optimization: if key range of current SSTable
-                // is already passed input key range, then break current loop to
-                // stop checking other SSTables.
-                if matched_once {
-                    // Current SSTable is already passed
-                    // current key range. Thus current and further
-                    // SSTables do not contain queried keys and can be ignored.
-                    break;
-                } else {
-                    // At this point none of the SSTables contained requested key range.
-                    // Thus continue checking other tables.
-                    continue;
-                }
-            }
-
-            matched_once = true;
-            sstables.push(Arc::clone(sstable));
+            level_iters.push(Box::new(level_iter));
         }
-
-        let l1_iter = match lower {
-            Bound::Included(lower) => {
-                SstConcatIterator::create_and_seek_to_key(sstables, Key::from_slice(lower))?
-            }
-            Bound::Excluded(lower) => {
-                let mut iter =
-                    SstConcatIterator::create_and_seek_to_key(sstables, Key::from_slice(lower))?;
-                if iter.is_valid() && iter.key().raw_ref() == lower {
-                    iter.next()?;
-                }
-                iter
-            }
-            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(sstables)?,
-        };
 
         Ok(FusedIterator::new(LsmIterator::new(
             TwoMergeIterator::create(
@@ -590,7 +601,7 @@ impl LsmStorageInner {
                     MergeIterator::create(memtable_iters),
                     MergeIterator::create(l0_sstable_iters),
                 )?,
-                l1_iter,
+                MergeIterator::create(level_iters),
             )?,
             map_bound(upper, Bytes::copy_from_slice),
         )?))

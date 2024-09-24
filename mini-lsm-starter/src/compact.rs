@@ -120,7 +120,6 @@ impl LsmStorageInner {
         };
 
         match task {
-            CompactionTask::Leveled(..) => todo!(),
             CompactionTask::Tiered(TieredCompactionTask { tiers, .. }) => {
                 assert!(!tiers.is_empty());
 
@@ -142,7 +141,13 @@ impl LsmStorageInner {
                 let iter = MergeIterator::create(tier_iters);
                 self.compact_iter(iter, task.compact_to_bottom_level())
             }
-            CompactionTask::Simple(SimpleLeveledCompactionTask {
+            CompactionTask::Leveled(LeveledCompactionTask {
+                upper_level,
+                upper_level_sst_ids,
+                lower_level_sst_ids,
+                ..
+            })
+            | CompactionTask::Simple(SimpleLeveledCompactionTask {
                 upper_level,
                 upper_level_sst_ids,
                 lower_level_sst_ids,

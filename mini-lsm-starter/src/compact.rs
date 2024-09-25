@@ -21,6 +21,7 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -243,7 +244,7 @@ impl LsmStorageInner {
         let new_ssts = self.compact(&compaction_task)?;
 
         {
-            let _state_lock = self.state_lock.lock();
+            let state_lock = self.state_lock.lock();
             let mut snapshot = {
                 let state = self.state.read();
                 state.as_ref().clone()
@@ -264,10 +265,22 @@ impl LsmStorageInner {
 
             snapshot.levels[0] = (1, new_ssts.iter().map(|sst| sst.sst_id()).collect());
 
+            let mut new_sstable_ids = Vec::new();
             for new_sstable in new_ssts {
                 let sst_id = new_sstable.sst_id();
                 snapshot.sstables.insert(sst_id, new_sstable);
+                new_sstable_ids.push(sst_id);
             }
+
+            self.sync_dir()?;
+
+            self.manifest
+                .as_ref()
+                .expect("manifest must exist")
+                .add_record(
+                    &state_lock,
+                    ManifestRecord::Compaction(compaction_task, new_sstable_ids),
+                )?;
 
             *self.state.write() = Arc::new(snapshot);
         }
@@ -275,6 +288,8 @@ impl LsmStorageInner {
         for sstable_id in l0_sstables.iter().chain(l1_sstables.iter()) {
             std::fs::remove_file(self.path_of_sst(*sstable_id))?;
         }
+
+        self.sync_dir()?;
 
         Ok(())
     }
@@ -300,10 +315,12 @@ impl LsmStorageInner {
             .collect::<Vec<_>>();
 
         let sstable_ids_to_remove = {
-            let _state_lock = self.state_lock.lock();
+            let state_lock = self.state_lock.lock();
             let mut snapshot = self.state.read().as_ref().clone();
 
+            let mut new_sstable_ids = Vec::new();
             for sstable in output.clone() {
+                new_sstable_ids.push(sstable.sst_id());
                 let result = snapshot.sstables.insert(sstable.sst_id(), sstable);
                 assert!(result.is_none());
             }
@@ -316,6 +333,16 @@ impl LsmStorageInner {
                 let result = snapshot.sstables.remove(sstable_id);
                 assert!(result.is_some());
             }
+
+            self.sync_dir()?;
+
+            self.manifest
+                .as_ref()
+                .expect("manifest must exist")
+                .add_record(
+                    &state_lock,
+                    ManifestRecord::Compaction(compaction_task, new_sstable_ids),
+                )?;
 
             {
                 let mut state_guard = self.state.write();
@@ -335,6 +362,8 @@ impl LsmStorageInner {
         for remove_sstable_id in sstable_ids_to_remove {
             std::fs::remove_file(self.path_of_sst(remove_sstable_id))?;
         }
+
+        self.sync_dir()?;
 
         Ok(())
     }

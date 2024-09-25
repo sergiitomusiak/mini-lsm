@@ -125,9 +125,7 @@ impl LeveledCompactionController {
             }
         }
 
-        let Some((_, upper_level)) = upper_level else {
-            return None;
-        };
+        let (_, upper_level) = upper_level?;
 
         let upper_level_sstable = *snapshot.levels[upper_level - 1]
             .1
@@ -153,7 +151,7 @@ impl LeveledCompactionController {
         snapshot: &LsmStorageState,
         task: &LeveledCompactionTask,
         output: &[usize],
-        _in_recovery: bool,
+        in_recovery: bool,
     ) -> (LsmStorageState, Vec<usize>) {
         let mut snapshot = snapshot.clone();
         let mut upper_level_sstable_ids = task.upper_level_sst_ids.iter().collect::<HashSet<_>>();
@@ -195,21 +193,22 @@ impl LeveledCompactionController {
         assert!(lower_level_sstable_ids.is_empty());
         new_lower_level_sstables.extend(output);
 
-        new_lower_level_sstables.sort_by(|sstable_1, sstable_2| {
-            snapshot
-                .sstables
-                .get(sstable_1)
-                .expect("sstable must exist")
-                .first_key()
-                .cmp(
-                    snapshot
-                        .sstables
-                        .get(sstable_2)
-                        .expect("sstable must exist")
-                        .first_key(),
-                )
-        });
-
+        if !in_recovery {
+            new_lower_level_sstables.sort_by(|sstable_1, sstable_2| {
+                snapshot
+                    .sstables
+                    .get(sstable_1)
+                    .expect("sstable must exist")
+                    .first_key()
+                    .cmp(
+                        snapshot
+                            .sstables
+                            .get(sstable_2)
+                            .expect("sstable must exist")
+                            .first_key(),
+                    )
+            });
+        }
         snapshot.levels[task.lower_level - 1].1 = new_lower_level_sstables;
 
         let mut sstables_to_remove = Vec::new();

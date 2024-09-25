@@ -67,14 +67,14 @@ impl SsTableBuilder {
         let added = self.builder.add(key, value);
         if !added {
             self.reset_block_builder();
+            self.block_first_key = Vec::from(key.raw_ref());
             let added = self.builder.add(key, value);
             assert!(added);
         }
 
         self.estimate_size += key.len() + value.len();
         self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
-        self.last_key.clear();
-        self.last_key.extend_from_slice(key.raw_ref());
+        self.last_key = Vec::from(key.raw_ref());
     }
 
     /// Get the estimated size of the SSTable.
@@ -96,7 +96,7 @@ impl SsTableBuilder {
             self.reset_block_builder();
         }
         let block_meta_offset = self.data.len();
-        BlockMeta::encode_block_meta(&mut self.meta, &mut self.data);
+        BlockMeta::encode_block_meta(&self.meta, &mut self.data);
         let block_meta_offset_bytes = u32::to_be_bytes(block_meta_offset as u32);
         self.data.extend_from_slice(&block_meta_offset_bytes);
 

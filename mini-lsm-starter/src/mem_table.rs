@@ -26,15 +26,6 @@ pub struct MemTable {
     approximate_size: Arc<AtomicUsize>,
 }
 
-/// Create a bound of `Bytes` from a bound of `&[u8]`.
-// pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
-//     match bound {
-//         Bound::Included(x) => Bound::Included(Bytes::copy_from_slice(x)),
-//         Bound::Excluded(x) => Bound::Excluded(Bytes::copy_from_slice(x)),
-//         Bound::Unbounded => Bound::Unbounded,
-//     }
-// }
-
 pub(crate) fn map_bound<T, U, F: FnOnce(T) -> U>(bound: Bound<T>, f: F) -> Bound<U> {
     match bound {
         Bound::Included(x) => Bound::Included(f(x)),
@@ -55,13 +46,31 @@ impl MemTable {
     }
 
     /// Create a new mem-table with WAL
-    pub fn create_with_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn create_with_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        let wal = Wal::create(path)?;
+        Ok(Self {
+            map: Arc::new(SkipMap::new()),
+            wal: Some(wal),
+            id,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     /// Create a memtable from WAL
-    pub fn recover_from_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        let skipmap = SkipMap::new();
+        let wal = Wal::recover(path, &skipmap)?;
+        let approximate_size = skipmap
+            .iter()
+            .map(|item| item.key().len() + item.value().len())
+            .sum::<usize>();
+
+        Ok(Self {
+            map: Arc::new(skipmap),
+            wal: Some(wal),
+            id,
+            approximate_size: Arc::new(AtomicUsize::new(approximate_size)),
+        })
     }
 
     pub fn for_testing_put_slice(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -95,6 +104,9 @@ impl MemTable {
             .fetch_add(key.len() + value.len(), std::sync::atomic::Ordering::AcqRel);
         self.map
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
+        if let Some(wal) = self.wal.as_ref() {
+            wal.put(key, value)?;
+        }
         Ok(())
     }
 

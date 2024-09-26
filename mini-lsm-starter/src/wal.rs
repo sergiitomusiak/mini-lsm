@@ -1,12 +1,12 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
-use std::fs::File;
-use std::io::BufWriter;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 
@@ -15,24 +15,67 @@ pub struct Wal {
 }
 
 impl Wal {
-    pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        Ok(Self {
+            file: Arc::new(Mutex::new(BufWriter::new(file))),
+        })
     }
 
-    pub fn recover(_path: impl AsRef<Path>, _skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
-        unimplemented!()
+    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
+        let mut file = OpenOptions::new().read(true).append(true).open(path)?;
+
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+
+        let mut data = bytes::Bytes::from(data);
+        while !data.is_empty() {
+            let key_len = data.get_u16();
+            let key = data.split_to(key_len as usize);
+            let val_len = data.get_u16();
+            let value = data.split_to(val_len as usize);
+            skiplist.insert(key, value);
+        }
+
+        Ok(Self {
+            file: Arc::new(Mutex::new(BufWriter::new(file))),
+        })
     }
 
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut file = self.file.lock();
+        Self::put_inner(&mut file, key, value)
     }
 
     /// Implement this in week 3, day 5.
-    pub fn put_batch(&self, _data: &[(&[u8], &[u8])]) -> Result<()> {
-        unimplemented!()
+    pub fn put_batch(&self, data: &[(&[u8], &[u8])]) -> Result<()> {
+        let mut file = self.file.lock();
+        for (key, value) in data {
+            Self::put_inner(&mut file, key, value)?;
+        }
+        Ok(())
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        let mut file = self.file.lock();
+        file.get_mut().sync_all()?;
+        Ok(())
+    }
+
+    fn put_inner(writer: &mut BufWriter<File>, key: &[u8], value: &[u8]) -> Result<()> {
+        let key_len = (key.len() as u16).to_be_bytes();
+        let val_len = (value.len() as u16).to_be_bytes();
+
+        writer.write_all(&key_len)?;
+        writer.write_all(key)?;
+        writer.write_all(&val_len)?;
+        writer.write_all(value)?;
+
+        Ok(())
     }
 }

@@ -34,11 +34,15 @@ impl Wal {
         file.read_to_end(&mut data)?;
 
         let mut data = bytes::Bytes::from(data);
-        while !data.is_empty() {
-            let key_len = data.get_u16();
-            let key = data.split_to(key_len as usize);
-            let val_len = data.get_u16();
-            let value = data.split_to(val_len as usize);
+        while data.has_remaining() {
+            let key_len = data.get_u16() as usize;
+            let key = Bytes::copy_from_slice(&data.chunk()[..key_len]);
+            data.advance(key_len);
+
+            let val_len = data.get_u16() as usize;
+            let value = Bytes::copy_from_slice(&data.chunk()[..val_len]);
+            data.advance(val_len);
+
             skiplist.insert(key, value);
         }
 
@@ -63,6 +67,7 @@ impl Wal {
 
     pub fn sync(&self) -> Result<()> {
         let mut file = self.file.lock();
+        file.flush()?;
         file.get_mut().sync_all()?;
         Ok(())
     }

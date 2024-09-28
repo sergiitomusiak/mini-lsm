@@ -19,7 +19,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::{
     merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator, StorageIterator,
 };
-use crate::key::Key;
+use crate::key::{self, Key};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{map_bound, MemTable};
@@ -460,18 +460,20 @@ impl LsmStorageInner {
 
             let is_key_within = key_within(
                 key,
-                Bound::Included(sstable.first_key().raw_ref()),
-                Bound::Included(sstable.last_key().raw_ref()),
+                Bound::Included(sstable.first_key().key_ref()),
+                Bound::Included(sstable.last_key().key_ref()),
             );
 
             if !is_key_within {
                 continue;
             }
 
-            let iter =
-                SsTableIterator::create_and_seek_to_key(Arc::clone(sstable), Key::from_slice(key))?;
+            let iter = SsTableIterator::create_and_seek_to_key(
+                Arc::clone(sstable),
+                Key::from_slice(key, key::TS_RANGE_BEGIN),
+            )?;
 
-            if iter.is_valid() && iter.key().raw_ref() == key {
+            if iter.is_valid() && iter.key().key_ref() == key {
                 let value = Some(iter.value())
                     .filter(|value| !value.is_empty())
                     .map(Bytes::copy_from_slice);
@@ -491,8 +493,8 @@ impl LsmStorageInner {
 
                 let is_key_within = key_within(
                     key,
-                    Bound::Included(sstable.first_key().raw_ref()),
-                    Bound::Included(sstable.last_key().raw_ref()),
+                    Bound::Included(sstable.first_key().key_ref()),
+                    Bound::Included(sstable.last_key().key_ref()),
                 );
 
                 if !is_key_within {
@@ -501,10 +503,10 @@ impl LsmStorageInner {
 
                 let iter = SsTableIterator::create_and_seek_to_key(
                     Arc::clone(sstable),
-                    Key::from_slice(key),
+                    Key::from_slice(key, key::TS_RANGE_BEGIN),
                 )?;
 
-                if iter.is_valid() && iter.key().raw_ref() == key {
+                if iter.is_valid() && iter.key().key_ref() == key {
                     let value = Some(iter.value())
                         .filter(|value| !value.is_empty())
                         .map(Bytes::copy_from_slice);
@@ -698,8 +700,8 @@ impl LsmStorageInner {
             };
 
             let does_range_overlap = range_overlap(
-                l0_sstable.first_key().raw_ref(),
-                l0_sstable.last_key().raw_ref(),
+                l0_sstable.first_key().key_ref(),
+                l0_sstable.last_key().key_ref(),
                 lower,
                 upper,
             );
@@ -711,14 +713,14 @@ impl LsmStorageInner {
             let iter = match lower {
                 Bound::Included(key) => SsTableIterator::create_and_seek_to_key(
                     Arc::clone(l0_sstable),
-                    Key::from_slice(key),
+                    Key::from_slice(key, key::TS_RANGE_BEGIN),
                 )?,
                 Bound::Excluded(key) => {
                     let mut iter = SsTableIterator::create_and_seek_to_key(
                         Arc::clone(l0_sstable),
-                        Key::from_slice(key),
+                        Key::from_slice(key, key::TS_RANGE_BEGIN),
                     )?;
-                    if iter.is_valid() && iter.key().raw_ref() == key {
+                    if iter.is_valid() && iter.key().key_ref() == key {
                         iter.next()?;
                     }
                     iter
@@ -741,8 +743,8 @@ impl LsmStorageInner {
                 };
 
                 let does_range_overlap = range_overlap(
-                    sstable.first_key().raw_ref(),
-                    sstable.last_key().raw_ref(),
+                    sstable.first_key().key_ref(),
+                    sstable.last_key().key_ref(),
                     lower,
                     upper,
                 );
@@ -768,15 +770,16 @@ impl LsmStorageInner {
             }
 
             let level_iter = match lower {
-                Bound::Included(lower) => {
-                    SstConcatIterator::create_and_seek_to_key(sstables, Key::from_slice(lower))?
-                }
+                Bound::Included(lower) => SstConcatIterator::create_and_seek_to_key(
+                    sstables,
+                    Key::from_slice(lower, key::TS_RANGE_BEGIN),
+                )?,
                 Bound::Excluded(lower) => {
                     let mut iter = SstConcatIterator::create_and_seek_to_key(
                         sstables,
-                        Key::from_slice(lower),
+                        Key::from_slice(lower, key::TS_RANGE_BEGIN),
                     )?;
-                    if iter.is_valid() && iter.key().raw_ref() == lower {
+                    if iter.is_valid() && iter.key().key_ref() == lower {
                         iter.next()?;
                     }
                     iter

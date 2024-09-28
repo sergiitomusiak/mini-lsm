@@ -32,7 +32,7 @@ impl BlockBuilder {
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
         let left_space = (self.block_size as isize - self.data.len() as isize) - 2;
-        let required_space = (key.len() + value.len() + 6) as isize;
+        let required_space = (key.raw_len() + value.len() + 6) as isize;
         let exceeds_block_size = required_space > left_space;
 
         if !self.data.is_empty() && exceeds_block_size {
@@ -41,27 +41,28 @@ impl BlockBuilder {
 
         let (key_overlap_len, rest_key_len) = if self.data.is_empty() {
             self.first_key = key.to_key_vec();
-            (0, key.len() as u16)
+            (0, key.key_len() as u16)
         } else {
             let mut key_overlap_len = 0;
-            let first_key = self.first_key.raw_ref();
-            let key_raw_ref = key.raw_ref();
-            for i in 0..self.first_key.len() {
+            let first_key = self.first_key.key_ref();
+            let key_raw_ref = key.key_ref();
+            for i in 0..self.first_key.key_len() {
                 if first_key[i] != key_raw_ref[i] {
                     key_overlap_len = i;
                     break;
                 }
             }
-            let rest_key_len = key.len() - key_overlap_len;
+            let rest_key_len = key.key_len() - key_overlap_len;
             (key_overlap_len as u16, rest_key_len as u16)
         };
 
         self.offsets.push(self.data.len() as u16);
-        // key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len)
+        // key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) | ts (u64)
         self.data.extend_from_slice(&key_overlap_len.to_be_bytes());
         self.data.extend_from_slice(&rest_key_len.to_be_bytes());
         self.data
-            .extend_from_slice(&key.raw_ref()[key_overlap_len as usize..]);
+            .extend_from_slice(&key.key_ref()[key_overlap_len as usize..]);
+        self.data.extend_from_slice(&key.ts().to_be_bytes());
 
         let val_len = value.len() as u16;
         self.data.extend_from_slice(&val_len.to_be_bytes());

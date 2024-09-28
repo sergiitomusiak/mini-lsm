@@ -66,3 +66,17 @@ pub(crate) fn u32_from_offset(data: &[u8], offset: usize) -> u32 {
     ];
     u32::from_be_bytes(value)
 }
+
+pub(crate) fn u64_from_offset(data: &[u8], offset: usize) -> u64 {
+    let value: [u8; 8] = [
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+    ];
+    u64::from_be_bytes(value)
+}

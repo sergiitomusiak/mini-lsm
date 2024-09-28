@@ -15,7 +15,7 @@ use bytes::{Buf, Bytes};
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
-use crate::key::{Key, KeyBytes, KeySlice};
+use crate::key::{self, Key, KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
 
 use self::bloom::Bloom;
@@ -41,14 +41,16 @@ impl BlockMeta {
     ) {
         for meta in block_meta {
             let offset = (meta.offset as u64).to_be_bytes();
-            let first_key_len = (meta.first_key.len() as u16).to_be_bytes();
-            let last_key_len = (meta.last_key.len() as u16).to_be_bytes();
+            let first_key_len = (meta.first_key.key_len() as u16).to_be_bytes();
+            let last_key_len = (meta.last_key.key_len() as u16).to_be_bytes();
 
             buf.extend_from_slice(&offset);
             buf.extend_from_slice(&first_key_len);
-            buf.extend_from_slice(meta.first_key.raw_ref());
+            buf.extend_from_slice(meta.first_key.key_ref());
+            buf.extend_from_slice(&meta.first_key.ts().to_be_bytes());
             buf.extend_from_slice(&last_key_len);
-            buf.extend_from_slice(meta.last_key.raw_ref());
+            buf.extend_from_slice(meta.last_key.key_ref());
+            buf.extend_from_slice(&meta.last_key.ts().to_be_bytes());
         }
     }
 
@@ -58,12 +60,16 @@ impl BlockMeta {
         while buf.remaining() > 0 {
             let offset = buf.get_u64() as usize;
             let first_key_len = buf.get_u16() as usize;
-            let first_key = Key::from_bytes(Bytes::copy_from_slice(&buf.chunk()[..first_key_len]));
+            let first_key = Bytes::copy_from_slice(&buf.chunk()[..first_key_len]);
             buf.advance(first_key_len);
+            let first_key_ts = buf.get_u64();
+            let first_key = Key::from_bytes_with_ts(first_key, first_key_ts);
 
             let last_key_len = buf.get_u16() as usize;
-            let last_key = Key::from_bytes(Bytes::copy_from_slice(&buf.chunk()[..last_key_len]));
+            let last_key = Bytes::copy_from_slice(&buf.chunk()[..last_key_len]);
             buf.advance(last_key_len);
+            let last_key_ts = buf.get_u64();
+            let last_key = Key::from_bytes_with_ts(last_key, last_key_ts);
 
             result.push(Self {
                 offset,

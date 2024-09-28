@@ -10,7 +10,7 @@ use bytes::Bytes;
 use super::{bloom::Bloom, BlockMeta, FileObject, SsTable};
 use crate::{
     block::BlockBuilder,
-    key::{KeyBytes, KeySlice, KeyVec},
+    key::{self, KeyBytes, KeySlice, KeyVec},
     lsm_storage::BlockCache,
 };
 
@@ -49,32 +49,32 @@ impl SsTableBuilder {
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         if self.first_key.is_empty() {
-            self.first_key = Vec::from(key.raw_ref());
+            self.first_key = Vec::from(key.key_ref());
         } else {
-            assert!(&self.first_key[..] < key.raw_ref());
+            assert!(&self.first_key[..] < key.key_ref());
         }
 
         if !self.last_key.is_empty() {
-            assert!(&self.last_key[..] < key.raw_ref());
+            assert!(&self.last_key[..] < key.key_ref());
         }
 
         if self.block_first_key.is_empty() {
-            self.block_first_key = Vec::from(key.raw_ref());
+            self.block_first_key = Vec::from(key.key_ref());
         } else {
-            assert!(&self.block_first_key[..] < key.raw_ref());
+            assert!(&self.block_first_key[..] < key.key_ref());
         }
 
         let added = self.builder.add(key, value);
         if !added {
             self.reset_block_builder();
-            self.block_first_key = Vec::from(key.raw_ref());
+            self.block_first_key = Vec::from(key.key_ref());
             let added = self.builder.add(key, value);
             assert!(added);
         }
 
-        self.estimate_size += key.len() + value.len();
-        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
-        self.last_key = Vec::from(key.raw_ref());
+        self.estimate_size += key.raw_len() + value.len();
+        self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
+        self.last_key = Vec::from(key.key_ref());
     }
 
     /// Get the estimated size of the SSTable.
@@ -114,8 +114,8 @@ impl SsTableBuilder {
             block_meta_offset,
             id,
             block_cache,
-            first_key: KeyBytes::from_bytes(Bytes::from(self.first_key)),
-            last_key: KeyBytes::from_bytes(Bytes::from(self.last_key)),
+            first_key: KeyBytes::from_bytes_with_ts(Bytes::from(self.first_key), key::TS_DEFAULT),
+            last_key: KeyBytes::from_bytes_with_ts(Bytes::from(self.last_key), key::TS_DEFAULT),
             bloom: Some(bloom),
             max_ts: 0,
         })
@@ -129,8 +129,13 @@ impl SsTableBuilder {
 
         let meta = BlockMeta {
             offset,
-            first_key: KeyVec::from_vec(std::mem::take(&mut self.block_first_key)).into_key_bytes(),
-            last_key: KeyVec::from_vec(self.last_key.clone()).into_key_bytes(),
+            first_key: KeyVec::from_vec_with_ts(
+                std::mem::take(&mut self.block_first_key),
+                key::TS_DEFAULT,
+            )
+            .into_key_bytes(),
+            last_key: KeyVec::from_vec_with_ts(self.last_key.clone(), key::TS_DEFAULT)
+                .into_key_bytes(),
         };
         self.meta.push(meta);
     }

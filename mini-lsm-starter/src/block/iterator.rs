@@ -4,7 +4,7 @@
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::{
-    block::u16_from_offset,
+    block::{u16_from_offset, u64_from_offset},
     key::{KeySlice, KeyVec},
 };
 
@@ -31,6 +31,8 @@ impl BlockIterator {
             assert_eq!(u16_from_offset(&block.data, 0), 0);
             let first_key_len = u16_from_offset(&block.data, 2);
             first_key.append(&block.data[4..4 + first_key_len as usize]);
+            let ts = u64_from_offset(&block.data, 4 + first_key_len as usize);
+            first_key.set_ts(ts);
         }
 
         Self {
@@ -99,7 +101,7 @@ impl BlockIterator {
 
         while start < end {
             let mid = (start + end) / 2;
-            match self.cmp_with_key_at(mid, key.raw_ref()) {
+            match self.cmp_with_key_at(mid, &key) {
                 Ordering::Equal => {
                     self.move_to_index(mid);
                     return;
@@ -109,7 +111,7 @@ impl BlockIterator {
             }
         }
 
-        if self.cmp_with_key_at(end, key.raw_ref()) == Ordering::Less {
+        if self.cmp_with_key_at(end, &key) == Ordering::Less {
             end += 1;
         }
         self.move_to_index(end);
@@ -127,22 +129,28 @@ impl BlockIterator {
         let key_offset = offset + 4;
         self.key.clear();
         self.key
-            .append(&self.first_key.raw_ref()[..key_overlap_len]);
+            .append(&self.first_key.key_ref()[..key_overlap_len]);
         self.key
             .append(&self.block.data[key_offset..key_offset + rest_key_len]);
-        let value_len = u16_from_offset(&self.block.data, key_offset + rest_key_len) as usize;
-        let value_offset = key_offset + rest_key_len + 2;
+        self.key
+            .set_ts(u64_from_offset(&self.block.data, key_offset + rest_key_len));
+        let value_len = u16_from_offset(
+            &self.block.data,
+            key_offset + rest_key_len + std::mem::size_of::<u64>(),
+        ) as usize;
+        let value_offset = key_offset + rest_key_len + 2 + std::mem::size_of::<u64>();
         self.value_range = (value_offset, value_offset + value_len);
     }
 
-    fn cmp_with_key_at(&self, entry_idx: usize, other_key: &[u8]) -> Ordering {
+    fn cmp_with_key_at(&self, entry_idx: usize, other_key: &KeySlice) -> Ordering {
         let offset = self.block.offsets[entry_idx] as usize;
         let key_overlap_len = u16_from_offset(&self.block.data, offset) as usize;
         let rest_key_len = u16_from_offset(&self.block.data, offset + 2) as usize;
         let key_offset = offset + 4;
         let mut key = KeyVec::new();
-        key.append(&self.first_key.raw_ref()[..key_overlap_len]);
+        key.append(&self.first_key.key_ref()[..key_overlap_len]);
         key.append(&self.block.data[key_offset..key_offset + rest_key_len]);
-        key.raw_ref().cmp(other_key)
+        key.set_ts(u64_from_offset(&self.block.data, key_offset + rest_key_len));
+        key.as_key_slice().cmp(other_key)
     }
 }

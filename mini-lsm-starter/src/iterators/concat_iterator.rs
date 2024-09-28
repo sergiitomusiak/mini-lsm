@@ -39,13 +39,13 @@ impl SstConcatIterator {
         let mut sstable_idx = sstables.len();
         for (i, sstable) in sstables.iter().enumerate() {
             let is_key_within = key_within(
-                key.raw_ref(),
+                &key.key_ref(),
                 Bound::Unbounded,
-                Bound::Excluded(sstable.first_key().raw_ref()),
+                Bound::Excluded(sstable.first_key().key_ref()),
             ) || key_within(
-                key.raw_ref(),
-                Bound::Included(sstable.first_key().raw_ref()),
-                Bound::Included(sstable.last_key().raw_ref()),
+                key.key_ref(),
+                Bound::Included(sstable.first_key().key_ref()),
+                Bound::Included(sstable.last_key().key_ref()),
             );
 
             if is_key_within {

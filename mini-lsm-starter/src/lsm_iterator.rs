@@ -50,14 +50,14 @@ impl StorageIterator for LsmIterator {
         }
 
         match &self.upper {
-            Bound::Excluded(upper) => self.inner.key().raw_ref() < upper,
-            Bound::Included(upper) => self.inner.key().raw_ref() <= upper,
+            Bound::Excluded(upper) => self.inner.key().key_ref() < upper,
+            Bound::Included(upper) => self.inner.key().key_ref() <= upper,
             Bound::Unbounded => true,
         }
     }
 
     fn key(&self) -> &[u8] {
-        self.inner.key().raw_ref()
+        self.inner.key().key_ref()
     }
 
     fn value(&self) -> &[u8] {

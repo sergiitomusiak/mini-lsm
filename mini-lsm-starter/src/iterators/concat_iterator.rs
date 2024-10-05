@@ -39,7 +39,7 @@ impl SstConcatIterator {
         let mut sstable_idx = sstables.len();
         for (i, sstable) in sstables.iter().enumerate() {
             let is_key_within = key_within(
-                &key.key_ref(),
+                key.key_ref(),
                 Bound::Unbounded,
                 Bound::Excluded(sstable.first_key().key_ref()),
             ) || key_within(
@@ -97,9 +97,5 @@ impl StorageIterator for SstConcatIterator {
                 .transpose()?;
         }
         Ok(())
-    }
-
-    fn num_active_iterators(&self) -> usize {
-        1
     }
 }

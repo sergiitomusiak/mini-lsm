@@ -11,11 +11,11 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 pub use builder::SsTableBuilder;
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
-use crate::key::{self, Key, KeyBytes, KeySlice};
+use crate::key::{Key, KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
 
 use self::bloom::Bloom;
@@ -34,11 +34,8 @@ impl BlockMeta {
     /// Encode block meta to a buffer.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
-    pub fn encode_block_meta(
-        block_meta: &[BlockMeta],
-        #[allow(clippy::ptr_arg)] // remove this allow after you finish
-        buf: &mut Vec<u8>,
-    ) {
+    pub fn encode_block_meta(block_meta: &[BlockMeta], max_ts: u64, buf: &mut Vec<u8>) {
+        buf.put_u64(max_ts);
         for meta in block_meta {
             let offset = (meta.offset as u64).to_be_bytes();
             let first_key_len = (meta.first_key.key_len() as u16).to_be_bytes();
@@ -55,8 +52,9 @@ impl BlockMeta {
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
+    pub fn decode_block_meta(mut buf: impl Buf) -> (Vec<BlockMeta>, u64) {
         let mut result = Vec::new();
+        let max_ts = buf.get_u64();
         while buf.remaining() > 0 {
             let offset = buf.get_u64() as usize;
             let first_key_len = buf.get_u16() as usize;
@@ -77,7 +75,7 @@ impl BlockMeta {
                 last_key,
             });
         }
-        result
+        (result, max_ts)
     }
 }
 
@@ -155,7 +153,7 @@ impl SsTable {
             block_meta_offset,
             file.size() - (4 + block_meta_offset) - (bloom_data.len() + 4) as u64,
         )?;
-        let block_meta = BlockMeta::decode_block_meta(Bytes::from(block_meta));
+        let (block_meta, max_ts) = BlockMeta::decode_block_meta(Bytes::from(block_meta));
 
         let first_key = block_meta
             .first()
@@ -178,7 +176,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts,
         })
     }
 

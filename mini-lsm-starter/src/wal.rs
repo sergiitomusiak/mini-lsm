@@ -5,6 +5,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::key::{KeyBytes, KeySlice};
 use anyhow::Result;
 use bytes::{Buf, Bytes};
 use crossbeam_skiplist::SkipMap;
@@ -27,7 +28,7 @@ impl Wal {
         })
     }
 
-    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
+    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<KeyBytes, Bytes>) -> Result<Self> {
         let mut file = OpenOptions::new().read(true).append(true).open(path)?;
 
         let mut data = Vec::new();
@@ -38,12 +39,13 @@ impl Wal {
             let key_len = data.get_u16() as usize;
             let key = Bytes::copy_from_slice(&data.chunk()[..key_len]);
             data.advance(key_len);
+            let ts = data.get_u64();
 
             let val_len = data.get_u16() as usize;
             let value = Bytes::copy_from_slice(&data.chunk()[..val_len]);
             data.advance(val_len);
 
-            skiplist.insert(key, value);
+            skiplist.insert(KeyBytes::from_bytes_with_ts(key, ts), value);
         }
 
         Ok(Self {
@@ -51,13 +53,13 @@ impl Wal {
         })
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
         let mut file = self.file.lock();
-        Self::put_inner(&mut file, key, value)
+        Self::put_inner(&mut file, &key, value)
     }
 
     /// Implement this in week 3, day 5.
-    pub fn put_batch(&self, data: &[(&[u8], &[u8])]) -> Result<()> {
+    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         let mut file = self.file.lock();
         for (key, value) in data {
             Self::put_inner(&mut file, key, value)?;
@@ -72,12 +74,14 @@ impl Wal {
         Ok(())
     }
 
-    fn put_inner(writer: &mut BufWriter<File>, key: &[u8], value: &[u8]) -> Result<()> {
-        let key_len = (key.len() as u16).to_be_bytes();
+    fn put_inner(writer: &mut BufWriter<File>, key: &KeySlice, value: &[u8]) -> Result<()> {
+        let key_len = (key.key_len() as u16).to_be_bytes();
         let val_len = (value.len() as u16).to_be_bytes();
+        let ts = key.ts().to_be_bytes();
 
         writer.write_all(&key_len)?;
-        writer.write_all(key)?;
+        writer.write_all(key.key_ref())?;
+        writer.write_all(&ts)?;
         writer.write_all(&val_len)?;
         writer.write_all(value)?;
 

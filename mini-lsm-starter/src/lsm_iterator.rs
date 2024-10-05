@@ -24,19 +24,38 @@ type LsmIteratorInner = TwoMergeIterator<
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     upper: Bound<Bytes>,
+    prev_key: Vec<u8>,
 }
 
 impl LsmIterator {
     pub(crate) fn new(iter: LsmIteratorInner, upper: Bound<Bytes>) -> Result<Self> {
-        let mut iter = Self { inner: iter, upper };
-        iter.move_to_non_deleted()?;
+        let mut iter = Self {
+            inner: iter,
+            upper,
+            prev_key: Vec::new(),
+        };
+        iter.move_to_key()?;
         Ok(iter)
     }
 
-    fn move_to_non_deleted(&mut self) -> Result<()> {
-        while self.is_valid() && self.value().is_empty() {
-            self.inner.next()?;
+    fn move_to_key(&mut self) -> Result<()> {
+        loop {
+            while self.is_valid() && self.inner.key().key_ref() == self.prev_key {
+                self.inner.next()?;
+            }
+
+            if !self.is_valid() {
+                break;
+            }
+
+            self.prev_key.clear();
+            self.prev_key.extend_from_slice(self.inner.key().key_ref());
+
+            if !self.inner.value().is_empty() {
+                break;
+            }
         }
+
         Ok(())
     }
 }
@@ -65,9 +84,9 @@ impl StorageIterator for LsmIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        let res = self.inner.next();
-        self.move_to_non_deleted()?;
-        res
+        self.inner.next()?;
+        self.move_to_key()?;
+        Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {

@@ -285,9 +285,9 @@ impl LsmStorageInner {
             *self.state.write() = Arc::new(snapshot);
         }
 
-        for sstable_id in l0_sstables.iter().chain(l1_sstables.iter()) {
-            std::fs::remove_file(self.path_of_sst(*sstable_id))?;
-        }
+        // for sstable_id in l0_sstables.iter().chain(l1_sstables.iter()) {
+        //     std::fs::remove_file(self.path_of_sst(*sstable_id))?;
+        // }
 
         self.sync_dir()?;
 
@@ -325,14 +325,14 @@ impl LsmStorageInner {
                 assert!(result.is_none());
             }
 
-            let (mut snapshot, sstable_ids_to_remove) = self
+            let (snapshot, sstable_ids_to_remove) = self
                 .compaction_controller
                 .apply_compaction_result(&snapshot, &compaction_task, &output_sstable_ids, false);
 
-            for sstable_id in sstable_ids_to_remove.iter() {
-                let result = snapshot.sstables.remove(sstable_id);
-                assert!(result.is_some());
-            }
+            // for sstable_id in sstable_ids_to_remove.iter() {
+            //     let result = snapshot.sstables.remove(sstable_id);
+            //     assert!(result.is_some());
+            // }
 
             self.sync_dir()?;
 
@@ -359,9 +359,9 @@ impl LsmStorageInner {
             output_sstable_ids,
         );
 
-        for remove_sstable_id in sstable_ids_to_remove {
-            std::fs::remove_file(self.path_of_sst(remove_sstable_id))?;
-        }
+        // for remove_sstable_id in sstable_ids_to_remove {
+        //     std::fs::remove_file(self.path_of_sst(remove_sstable_id))?;
+        // }
 
         self.sync_dir()?;
 
@@ -425,14 +425,17 @@ impl LsmStorageInner {
         Ok(Some(handle))
     }
 
-    fn compact_iter<I>(&self, mut iter: I, is_bottom_level: bool) -> Result<Vec<Arc<SsTable>>>
+    fn compact_iter<I>(&self, mut iter: I, _is_bottom_level: bool) -> Result<Vec<Arc<SsTable>>>
     where
         I: for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
     {
         let mut new_sstables = Vec::new();
         let mut sstable_builder = SsTableBuilder::new(self.options.block_size);
+        let mut prev_key = crate::key::KeyVec::new();
+        let mut can_flush;
         while iter.is_valid() {
-            if sstable_builder.estimated_size() >= self.options.target_sst_size {
+            can_flush = iter.key().key_ref() != prev_key.key_ref();
+            if can_flush && sstable_builder.estimated_size() >= self.options.target_sst_size {
                 let id = self.next_sst_id();
                 new_sstables.push(Arc::new(sstable_builder.build(
                     id,
@@ -443,9 +446,11 @@ impl LsmStorageInner {
                 sstable_builder = SsTableBuilder::new(self.options.block_size);
             }
 
-            if !is_bottom_level || !iter.value().is_empty() {
-                sstable_builder.add(iter.key(), iter.value());
-            }
+            sstable_builder.add(iter.key(), iter.value());
+            prev_key.set_from_slice(iter.key());
+            // if !is_bottom_level || !iter.value().is_empty() {
+            //     sstable_builder.add(iter.key(), iter.value());
+            // }
 
             iter.next()?;
         }

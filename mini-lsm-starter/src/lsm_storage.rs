@@ -269,6 +269,10 @@ impl MiniLsm {
 }
 
 impl LsmStorageInner {
+    pub(crate) fn mvcc(&self) -> &LsmMvccInner {
+        self.mvcc.as_ref().unwrap()
+    }
+
     pub(crate) fn next_sst_id(&self) -> usize {
         self.next_sst_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -299,7 +303,7 @@ impl LsmStorageInner {
 
         let mut next_sst_id = 1;
         let manifest_path = path.join("MANIFEST");
-        let manifest = if !manifest_path.exists() {
+        let (manifest, last_commit_ts) = if !manifest_path.exists() {
             if options.enable_wal {
                 state.memtable = Arc::new(MemTable::create_with_wal(
                     state.memtable.id(),
@@ -308,10 +312,11 @@ impl LsmStorageInner {
             }
             let manifest = Manifest::create(&manifest_path).context("failed to create manifest")?;
             manifest.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
-            manifest
+            (manifest, 0)
         } else {
             let (manifest, records) = Manifest::recover(manifest_path)?;
             let mut memtables = BTreeSet::new();
+            let mut last_commit_ts = 0;
             for record in records {
                 match record {
                     ManifestRecord::Flush(sstable_id) => {
@@ -359,6 +364,7 @@ impl LsmStorageInner {
                     Some(block_cache.clone()),
                     FileObject::open(&Self::path_of_sst_static(path, sstable_id))?,
                 )?;
+                last_commit_ts = last_commit_ts.max(sstable.max_ts());
                 state.sstables.insert(sstable_id, Arc::new(sstable));
             }
 
@@ -390,6 +396,15 @@ impl LsmStorageInner {
                         Self::path_of_wal_static(path, sstable_id),
                     )?;
 
+                    let max_ts = memtable
+                        .map
+                        .iter()
+                        .map(|item| item.key().ts())
+                        .max()
+                        .unwrap_or_default();
+
+                    last_commit_ts = last_commit_ts.max(max_ts);
+
                     if !memtable.is_empty() {
                         state.imm_memtables.insert(0, Arc::new(memtable));
                     }
@@ -404,7 +419,7 @@ impl LsmStorageInner {
 
             manifest.add_record_when_init(ManifestRecord::NewMemtable(next_sst_id))?;
             next_sst_id += 1;
-            manifest
+            (manifest, last_commit_ts)
         };
 
         let storage = Self {
@@ -416,7 +431,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
-            mvcc: None,
+            mvcc: Some(LsmMvccInner::new(last_commit_ts)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -434,85 +449,14 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let state = {
-            let state = self.state.read();
-            Arc::clone(&state)
-        };
+        let iter = self.scan(Bound::Included(key), Bound::Included(key))?;
 
-        if let Some(value) = state.memtable.get(key) {
-            return Ok(Some(value).filter(|value| !value.is_empty()));
-        }
+        if iter.is_valid() && iter.key() == key {
+            let value = Some(iter.value())
+                .filter(|value| !value.is_empty())
+                .map(Bytes::copy_from_slice);
 
-        for imm_memtable in state.imm_memtables.iter() {
-            if let Some(value) = imm_memtable.get(key) {
-                return Ok(Some(value).filter(|value| !value.is_empty()));
-            }
-        }
-
-        for l0_sstable_id in state.l0_sstables.iter() {
-            let Some(sstable) = state.sstables.get(l0_sstable_id) else {
-                bail!("sstable with id={l0_sstable_id} is missing");
-            };
-
-            if !sstable.may_contain(key) {
-                continue;
-            }
-
-            let is_key_within = key_within(
-                key,
-                Bound::Included(sstable.first_key().key_ref()),
-                Bound::Included(sstable.last_key().key_ref()),
-            );
-
-            if !is_key_within {
-                continue;
-            }
-
-            let iter = SsTableIterator::create_and_seek_to_key(
-                Arc::clone(sstable),
-                Key::from_slice(key, key::TS_RANGE_BEGIN),
-            )?;
-
-            if iter.is_valid() && iter.key().key_ref() == key {
-                let value = Some(iter.value())
-                    .filter(|value| !value.is_empty())
-                    .map(Bytes::copy_from_slice);
-                return Ok(value);
-            }
-        }
-
-        for level in 0..state.levels.len() {
-            for sstable_id in state.levels[level].1.iter() {
-                let Some(sstable) = state.sstables.get(sstable_id) else {
-                    bail!("sstable with id={sstable_id} is missing");
-                };
-
-                if !sstable.may_contain(key) {
-                    continue;
-                }
-
-                let is_key_within = key_within(
-                    key,
-                    Bound::Included(sstable.first_key().key_ref()),
-                    Bound::Included(sstable.last_key().key_ref()),
-                );
-
-                if !is_key_within {
-                    continue;
-                }
-
-                let iter = SsTableIterator::create_and_seek_to_key(
-                    Arc::clone(sstable),
-                    Key::from_slice(key, key::TS_RANGE_BEGIN),
-                )?;
-
-                if iter.is_valid() && iter.key().key_ref() == key {
-                    let value = Some(iter.value())
-                        .filter(|value| !value.is_empty())
-                        .map(Bytes::copy_from_slice);
-                    return Ok(value);
-                }
-            }
+            return Ok(value);
         }
 
         Ok(None)
@@ -520,6 +464,8 @@ impl LsmStorageInner {
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        let _write_lock = self.mvcc().write_lock.lock();
+        let last_commit_ts = self.mvcc().latest_commit_ts() + 1;
         for record in batch {
             match record {
                 WriteBatchRecord::Put(key, value) => {
@@ -527,22 +473,25 @@ impl LsmStorageInner {
                     let value = value.as_ref();
                     assert!(!key.is_empty(), "key cannot be empty");
                     assert!(!value.is_empty(), "value cannot be empty");
-                    self.put_internal(key, value)?;
+                    self.put_internal(key, value, last_commit_ts)?;
                 }
                 WriteBatchRecord::Del(key) => {
                     let key = key.as_ref();
                     assert!(!key.is_empty(), "key cannot be empty");
-                    self.put_internal(key, b"")?;
+                    self.put_internal(key, b"", last_commit_ts)?;
                 }
             }
         }
+        self.mvcc().update_commit_ts(last_commit_ts);
         Ok(())
     }
 
-    pub fn put_internal(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put_internal(&self, key: &[u8], value: &[u8], last_commit_ts: u64) -> Result<()> {
         {
             let state = self.state.read();
-            state.memtable.put(key, value)?;
+            state
+                .memtable
+                .put(Key::from_slice(key, last_commit_ts), value)?;
         }
 
         if self.memtable_reached_capacity() {
@@ -688,9 +637,16 @@ impl LsmStorageInner {
             Arc::clone(&state)
         };
 
-        let mut memtable_iters = vec![Box::new(state.memtable.scan(lower, upper))];
+        let mut memtable_iters = vec![Box::new(state.memtable.scan(
+            map_bound(lower, |lower| Key::from_slice(lower, key::TS_RANGE_BEGIN)),
+            map_bound(upper, |upper| Key::from_slice(upper, key::TS_RANGE_END)),
+        ))];
+
         for imm_memtable in state.imm_memtables.iter() {
-            memtable_iters.push(Box::new(imm_memtable.scan(lower, upper)));
+            memtable_iters.push(Box::new(imm_memtable.scan(
+                map_bound(lower, |lower| Key::from_slice(lower, key::TS_RANGE_BEGIN)),
+                map_bound(upper, |upper| Key::from_slice(upper, key::TS_RANGE_END)),
+            )));
         }
 
         let mut l0_sstable_iters = Vec::with_capacity(state.l0_sstables.len());

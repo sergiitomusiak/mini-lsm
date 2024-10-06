@@ -228,9 +228,4 @@ impl StorageIterator for MemTableIterator {
         });
         Ok(())
     }
-
-    fn num_active_iterators(&self) -> usize {
-        println!("Memtable {:?} num iterators = 1", self.borrow_id());
-        1
-    }
 }

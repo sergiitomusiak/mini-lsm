@@ -23,7 +23,8 @@ use crate::key::{self, Key};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{map_bound, MemTable};
-use crate::mvcc::LsmMvccInner;
+use crate::mvcc::txn::TxnIterator;
+use crate::mvcc::{txn::Transaction, LsmMvccInner};
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
@@ -215,7 +216,7 @@ impl MiniLsm {
         }))
     }
 
-    pub fn new_txn(&self) -> Result<()> {
+    pub fn new_txn(&self) -> Result<Arc<Transaction>> {
         self.inner.new_txn()
     }
 
@@ -247,7 +248,7 @@ impl MiniLsm {
         &self,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
+    ) -> Result<FusedIterator<TxnIterator>> {
         self.inner.scan(lower, upper)
     }
 
@@ -448,8 +449,13 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let iter = self.scan(Bound::Included(key), Bound::Included(key))?;
+    pub fn get(self: &Arc<Self>, key: &[u8]) -> Result<Option<Bytes>> {
+        let txn = self.new_txn()?;
+        txn.get(key)
+    }
+
+    pub(crate) fn get_with_ts(&self, key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
+        let iter = self.scan_with_ts(Bound::Included(key), Bound::Included(key), read_ts)?;
 
         if iter.is_valid() && iter.key() == key {
             let value = Some(iter.value())
@@ -621,16 +627,26 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn new_txn(&self) -> Result<()> {
-        // no-op
-        Ok(())
+    pub fn new_txn(self: &Arc<Self>) -> Result<Arc<Transaction>> {
+        let txn = self.mvcc().new_txn(self.clone(), self.options.serializable);
+        Ok(txn)
     }
 
     /// Create an iterator over a range of keys.
     pub fn scan(
+        self: &Arc<Self>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> Result<FusedIterator<TxnIterator>> {
+        let txn = self.new_txn()?;
+        txn.scan(lower, upper).map(FusedIterator::new)
+    }
+
+    pub(crate) fn scan_with_ts(
         &self,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
+        read_ts: u64,
     ) -> Result<FusedIterator<LsmIterator>> {
         let state = {
             let state = self.state.read();
@@ -755,6 +771,7 @@ impl LsmStorageInner {
                 MergeIterator::create(level_iters),
             )?,
             map_bound(upper, Bytes::copy_from_slice),
+            read_ts,
         )?))
     }
 

@@ -425,17 +425,23 @@ impl LsmStorageInner {
         Ok(Some(handle))
     }
 
-    fn compact_iter<I>(&self, mut iter: I, _is_bottom_level: bool) -> Result<Vec<Arc<SsTable>>>
+    fn compact_iter<I>(&self, mut iter: I, is_bottom_level: bool) -> Result<Vec<Arc<SsTable>>>
     where
         I: for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
     {
         let mut new_sstables = Vec::new();
         let mut sstable_builder = SsTableBuilder::new(self.options.block_size);
         let mut prev_key = crate::key::KeyVec::new();
-        let mut can_flush;
+        let mut new_key;
+        let mut seen_version_below_watermark = false;
+        let watermark = self.mvcc().watermark();
         while iter.is_valid() {
-            can_flush = iter.key().key_ref() != prev_key.key_ref();
-            if can_flush && sstable_builder.estimated_size() >= self.options.target_sst_size {
+            new_key = iter.key().key_ref() != prev_key.key_ref();
+            if new_key {
+                seen_version_below_watermark = false;
+            }
+
+            if new_key && sstable_builder.estimated_size() >= self.options.target_sst_size {
                 let id = self.next_sst_id();
                 new_sstables.push(Arc::new(sstable_builder.build(
                     id,
@@ -446,11 +452,18 @@ impl LsmStorageInner {
                 sstable_builder = SsTableBuilder::new(self.options.block_size);
             }
 
-            sstable_builder.add(iter.key(), iter.value());
             prev_key.set_from_slice(iter.key());
-            // if !is_bottom_level || !iter.value().is_empty() {
-            //     sstable_builder.add(iter.key(), iter.value());
-            // }
+
+            let remove_entry = (seen_version_below_watermark && iter.key().ts() <= watermark)
+                || (is_bottom_level && iter.value().is_empty() && iter.key().ts() == watermark);
+
+            if iter.key().ts() <= watermark {
+                seen_version_below_watermark = true;
+            }
+
+            if !remove_entry {
+                sstable_builder.add(iter.key(), iter.value());
+            }
 
             iter.next()?;
         }

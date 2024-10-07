@@ -36,16 +36,19 @@ impl Wal {
 
         let mut data = bytes::Bytes::from(data);
         while data.has_remaining() {
-            let key_len = data.get_u16() as usize;
-            let key = Bytes::copy_from_slice(&data.chunk()[..key_len]);
-            data.advance(key_len);
-            let ts = data.get_u64();
+            let batch_size = data.get_u32();
+            for _ in 0..batch_size {
+                let key_len = data.get_u16() as usize;
+                let key = Bytes::copy_from_slice(&data.chunk()[..key_len]);
+                data.advance(key_len);
+                let ts = data.get_u64();
 
-            let val_len = data.get_u16() as usize;
-            let value = Bytes::copy_from_slice(&data.chunk()[..val_len]);
-            data.advance(val_len);
+                let val_len = data.get_u16() as usize;
+                let value = Bytes::copy_from_slice(&data.chunk()[..val_len]);
+                data.advance(val_len);
 
-            skiplist.insert(KeyBytes::from_bytes_with_ts(key, ts), value);
+                skiplist.insert(KeyBytes::from_bytes_with_ts(key, ts), value);
+            }
         }
 
         Ok(Self {
@@ -54,15 +57,24 @@ impl Wal {
     }
 
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
-        let mut file = self.file.lock();
-        Self::put_inner(&mut file, &key, value)
+        self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5.
     pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         let mut file = self.file.lock();
+
+        file.write_all(&(data.len() as u32).to_be_bytes())?;
         for (key, value) in data {
-            Self::put_inner(&mut file, key, value)?;
+            let key_len = (key.key_len() as u16).to_be_bytes();
+            let val_len = (value.len() as u16).to_be_bytes();
+            let ts = key.ts().to_be_bytes();
+
+            file.write_all(&key_len)?;
+            file.write_all(key.key_ref())?;
+            file.write_all(&ts)?;
+            file.write_all(&val_len)?;
+            file.write_all(value)?;
         }
         Ok(())
     }
@@ -71,20 +83,6 @@ impl Wal {
         let mut file = self.file.lock();
         file.flush()?;
         file.get_mut().sync_all()?;
-        Ok(())
-    }
-
-    fn put_inner(writer: &mut BufWriter<File>, key: &KeySlice, value: &[u8]) -> Result<()> {
-        let key_len = (key.key_len() as u16).to_be_bytes();
-        let val_len = (value.len() as u16).to_be_bytes();
-        let ts = key.ts().to_be_bytes();
-
-        writer.write_all(&key_len)?;
-        writer.write_all(key.key_ref())?;
-        writer.write_all(&ts)?;
-        writer.write_all(&val_len)?;
-        writer.write_all(value)?;
-
         Ok(())
     }
 }

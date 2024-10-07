@@ -19,7 +19,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::{
     merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator, StorageIterator,
 };
-use crate::key::{self, Key};
+use crate::key::{self, Key, KeySlice};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{map_bound, MemTable};
@@ -472,23 +472,65 @@ impl LsmStorageInner {
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         let _write_lock = self.mvcc().write_lock.lock();
         let last_commit_ts = self.mvcc().latest_commit_ts() + 1;
-        for record in batch {
-            match record {
-                WriteBatchRecord::Put(key, value) => {
-                    let key = key.as_ref();
-                    let value = value.as_ref();
-                    assert!(!key.is_empty(), "key cannot be empty");
-                    assert!(!value.is_empty(), "value cannot be empty");
-                    self.put_internal(key, value, last_commit_ts)?;
+
+        let batch = batch
+            .iter()
+            .map(|record| {
+                match record {
+                    WriteBatchRecord::Put(key, value) => {
+                        let key = key.as_ref();
+                        let value = value.as_ref();
+                        assert!(!key.is_empty(), "key cannot be empty");
+                        assert!(!value.is_empty(), "value cannot be empty");
+                        // self.put_internal(key, value, last_commit_ts)?;
+                        (KeySlice::from_slice(key, last_commit_ts), value)
+                    }
+                    WriteBatchRecord::Del(key) => {
+                        let key = key.as_ref();
+                        assert!(!key.is_empty(), "key cannot be empty");
+                        //self.put_internal(key, b"", last_commit_ts)?;
+                        (KeySlice::from_slice(key, last_commit_ts), b"".as_ref())
+                    }
                 }
-                WriteBatchRecord::Del(key) => {
-                    let key = key.as_ref();
-                    assert!(!key.is_empty(), "key cannot be empty");
-                    self.put_internal(key, b"", last_commit_ts)?;
-                }
+            })
+            .collect::<Vec<_>>();
+
+        self.write_batch_internal(&batch)?;
+
+        // for record in batch {
+        //     match record {
+        //         WriteBatchRecord::Put(key, value) => {
+        //             let key = key.as_ref();
+        //             let value = value.as_ref();
+        //             assert!(!key.is_empty(), "key cannot be empty");
+        //             assert!(!value.is_empty(), "value cannot be empty");
+        //             self.put_internal(key, value, last_commit_ts)?;
+        //         }
+        //         WriteBatchRecord::Del(key) => {
+        //             let key = key.as_ref();
+        //             assert!(!key.is_empty(), "key cannot be empty");
+        //             self.put_internal(key, b"", last_commit_ts)?;
+        //         }
+        //     }
+        // }
+
+        self.mvcc().update_commit_ts(last_commit_ts);
+        Ok(())
+    }
+
+    pub fn write_batch_internal(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        {
+            let state = self.state.read();
+            state.memtable.put_batch(data)?;
+        }
+
+        if self.memtable_reached_capacity() {
+            let state_lock = self.state_lock.lock();
+            if self.memtable_reached_capacity() {
+                self.force_freeze_memtable(&state_lock)?;
             }
         }
-        self.mvcc().update_commit_ts(last_commit_ts);
+
         Ok(())
     }
 

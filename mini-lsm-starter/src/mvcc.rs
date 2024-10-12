@@ -63,12 +63,14 @@ impl LsmMvccInner {
             read_ts
         };
 
+        let key_hashes = serializable.then(|| Mutex::new((HashSet::new(), HashSet::new())));
+
         Arc::new(Transaction {
             read_ts,
             inner,
             local_storage: Arc::new(SkipMap::new()),
             committed: Arc::new(AtomicBool::new(false)),
-            key_hashes: None,
+            key_hashes,
         })
     }
 }

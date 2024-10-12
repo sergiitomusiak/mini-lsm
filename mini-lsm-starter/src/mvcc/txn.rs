@@ -13,12 +13,13 @@ use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
 use parking_lot::Mutex;
 
-use crate::lsm_storage::WriteBatchRecord;
+use crate::key::KeyBytes;
 use crate::{
     iterators::{two_merge_iterator::TwoMergeIterator, StorageIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::LsmStorageInner,
     mem_table::map_bound,
+    mvcc::CommittedTxnData,
 };
 
 pub struct Transaction {
@@ -33,6 +34,7 @@ pub struct Transaction {
 impl Transaction {
     pub fn get(self: &Arc<Self>, key: &[u8]) -> Result<Option<Bytes>> {
         self.check_commited()?;
+        self.record_read(key);
         let iter = self.scan(Bound::Included(key), Bound::Included(key))?;
 
         if iter.is_valid() && iter.key() == key {
@@ -62,38 +64,109 @@ impl Transaction {
         local_iter.next()?;
         let storage_iter = self.inner.scan_with_ts(lower, upper, self.read_ts)?;
         let iter = TwoMergeIterator::create(local_iter, storage_iter)?;
-        TxnIterator::create(self.clone(), iter)
+        let mut iter = TxnIterator::create(self.clone(), iter)?;
+        iter.record_current_key();
+        Ok(iter)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_commited()?;
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
+        if let Some(key_hashes) = self.key_hashes.as_ref() {
+            let mut key_hashes = key_hashes.lock();
+            key_hashes.1.insert(farmhash::hash32(key));
+        }
         Ok(())
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.check_commited()?;
-        self.local_storage
-            .insert(Bytes::copy_from_slice(key), Bytes::new());
-        Ok(())
+        self.put(key, b"")
     }
 
     pub fn commit(&self) -> Result<()> {
         self.check_commited()?;
         self.committed.store(true, Ordering::Release);
+        let _commit_lock = self.inner.mvcc().commit_lock.lock();
+        let last_commit_ts = self.inner.mvcc().latest_commit_ts() + 1;
+
+        let committed_txn_data = if let Some(key_hashes) = self.key_hashes.as_ref() {
+            // Txn is serializable. Validatation is request.
+            let mut key_hashes = key_hashes.lock();
+            dbg!(format!(
+                "Committing Txn(read_ts={:?}, commit_ts={:?}, read_write={:?}",
+                self.read_ts, last_commit_ts, key_hashes
+            ));
+            if !key_hashes.1.is_empty() {
+                let committed_txns = self.inner.mvcc().committed_txns.lock();
+
+                let committed_keys = committed_txns
+                    .range((
+                        Bound::Excluded(self.read_ts),
+                        Bound::Excluded(last_commit_ts),
+                    ))
+                    .flat_map(|txn| txn.1.key_hashes.iter());
+
+                for committed_key in committed_keys {
+                    if key_hashes.0.contains(committed_key) {
+                        return Err(anyhow!("Aborting transaction: There is a conflict with one of the previous committed transactions"));
+                    }
+                }
+
+                Some(CommittedTxnData {
+                    key_hashes: std::mem::take(&mut key_hashes.1),
+                    read_ts: self.read_ts,
+                    commit_ts: last_commit_ts,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let write_batch = self
             .local_storage
             .iter()
             .map(|entry| {
-                if !entry.value().is_empty() {
-                    WriteBatchRecord::Put(entry.key().clone(), entry.value().clone())
-                } else {
-                    WriteBatchRecord::Del(entry.key().clone())
-                }
+                (
+                    KeyBytes::from_bytes_with_ts(entry.key().clone(), last_commit_ts),
+                    entry.value().clone(),
+                )
             })
             .collect::<Vec<_>>();
-        self.inner.write_batch(&write_batch)?;
+
+        let write_batch = write_batch
+            .iter()
+            .map(|(key, value)| (key.as_key_slice(), value.as_ref()))
+            .collect::<Vec<_>>();
+
+        self.inner.write_batch_internal(&write_batch)?;
+
+        if let Some(committed_txn_data) = committed_txn_data {
+            self.inner
+                .mvcc()
+                .committed_txns
+                .lock()
+                .insert(last_commit_ts, committed_txn_data);
+        }
+
+        {
+            let mut committed_txns = self.inner.mvcc().committed_txns.lock();
+
+            let watermark = self.inner.mvcc().watermark();
+            while committed_txns
+                .first_key_value()
+                .as_ref()
+                .map(|(key, _)| **key < watermark)
+                .unwrap_or(false)
+            {
+                let removed = committed_txns.pop_first();
+                assert!(removed.is_some());
+            }
+        }
+
+        self.inner.mvcc().update_commit_ts(last_commit_ts);
         Ok(())
     }
 
@@ -102,6 +175,14 @@ impl Transaction {
             return Err(anyhow!("transaction is already commited"));
         }
         Ok(())
+    }
+
+    fn record_read(self: &Arc<Self>, key: &[u8]) {
+        if let Some(key_hashes) = self.key_hashes.as_ref() {
+            let key_hash = farmhash::hash32(key);
+            let mut key_hashes = key_hashes.lock();
+            key_hashes.0.insert(key_hash);
+        }
     }
 }
 
@@ -165,6 +246,14 @@ impl TxnIterator {
     ) -> Result<Self> {
         Ok(Self { txn, iter })
     }
+
+    fn record_current_key(&mut self) {
+        if self.is_valid() {
+            let key = self.iter.key();
+            let key_hash = farmhash::hash32(key);
+            self.txn.record_read(key);
+        }
+    }
 }
 
 impl StorageIterator for TxnIterator {
@@ -185,6 +274,7 @@ impl StorageIterator for TxnIterator {
     fn next(&mut self) -> Result<()> {
         loop {
             self.iter.next()?;
+            self.record_current_key();
             if !self.is_valid() || !self.value().is_empty() {
                 break;
             }

@@ -124,6 +124,14 @@ pub enum CompactionFilter {
     Prefix(Bytes),
 }
 
+impl CompactionFilter {
+    pub(crate) fn matches(&self, key: &[u8]) -> bool {
+        match &self {
+            CompactionFilter::Prefix(prefix) => key.starts_with(prefix.as_ref()),
+        }
+    }
+}
+
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
     pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,

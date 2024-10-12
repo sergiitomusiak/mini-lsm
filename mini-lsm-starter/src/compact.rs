@@ -454,11 +454,14 @@ impl LsmStorageInner {
 
             prev_key.set_from_slice(iter.key());
 
-            let remove_entry = (seen_version_below_watermark && iter.key().ts() <= watermark)
+            let mut remove_entry = (seen_version_below_watermark && iter.key().ts() <= watermark)
                 || (is_bottom_level && iter.value().is_empty() && iter.key().ts() == watermark);
 
-            if iter.key().ts() <= watermark {
+            if iter.key().ts() <= watermark && !seen_version_below_watermark {
                 seen_version_below_watermark = true;
+                if self.compact_filter(iter.key().key_ref()) {
+                    remove_entry = true;
+                }
             }
 
             if !remove_entry {
@@ -478,5 +481,15 @@ impl LsmStorageInner {
         }
 
         Ok(new_sstables)
+    }
+
+    fn compact_filter(&self, key: &[u8]) -> bool {
+        let compaction_filters = self.compaction_filters.lock();
+        for compaction_filter in compaction_filters.iter() {
+            if compaction_filter.matches(key) {
+                return true;
+            }
+        }
+        false
     }
 }
